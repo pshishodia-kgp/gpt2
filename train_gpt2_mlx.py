@@ -7,8 +7,6 @@ import mlx.optimizers as optim
 from functools import partial
 
 
-# mlx.set_float32_matmul_precision('medium')
-
 mlx.core.random.seed(424)
 class GPTConfig:
     VOCAB_SIZE = 50257
@@ -21,13 +19,9 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.c_fc = nn.Linear(config.DIM, 4 * config.DIM) ## up projection
-        self.c_fc.weight = self.c_fc.weight.astype(mx.bfloat16)
-        self.c_fc.bias = self.c_fc.bias.astype(mx.bfloat16)
         
         self.gelu = nn.GELU(approx='fast')
         self.c_proj = nn.Linear(4 * config.DIM, config.DIM)
-        self.c_proj.weight = self.c_proj.weight.astype(mx.bfloat16)
-        self.c_proj.bias = self.c_proj.bias.astype(mx.bfloat16)
 
     def __call__(self, x):
         x = self.c_fc(x)
@@ -35,62 +29,20 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        assert config.DIM % config.NUM_HEADS == 0, \
-            f'DIM/NUM_HEADS = {config.DIM} / {config.NUM_HEADS} = {config.DIM / config.NUM_HEADS} is not an integer.'
-
-        self.dim, self.num_heads = config.DIM, config.NUM_HEADS
-        # key, query, value projections combined.
-        self.c_attn = nn.Linear(config.DIM, 3 * config.DIM)
-        self.c_proj = nn.Linear(config.DIM, config.DIM)
-        
-    def __call__(self, x):
-        qkv = self.c_attn(x)
-        q, k, v = qkv.split(3, axis=-1)
-        B, T, C = q.shape
-        
-        k = k.view(B, T, self.num_heads, self.dim // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.num_heads, self.dim // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.num_heads, self.dim // self.num_heads).transpose(1, 2) # (B, nh, T, hs)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # flash attention
-        y = y.transpose(1, 2).contiguous().view(B, T, self.dim) # re-assemble all head outputs side by side
-        # output projection
-        y = self.c_proj(y)
-        return y
-
 
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.ln_1 = nn.LayerNorm(config.DIM)
-        self.ln_1.weight = self.ln_1.weight.astype(mx.bfloat16)
-        self.ln_1.bias = self.ln_1.bias.astype(mx.bfloat16)
 
         self.attn = nn.MultiHeadAttention(dims=config.DIM, num_heads=config.NUM_HEADS)
-        self.attn.query_proj.weight = self.attn.query_proj.weight.astype(mx.bfloat16)
 
-        
-        self.attn.key_proj.weight = self.attn.key_proj.weight.astype(mx.bfloat16)
-
-        
-        self.attn.value_proj.weight = self.attn.value_proj.weight.astype(mx.bfloat16)
-        
-        self.attn.out_proj.weight = self.attn.out_proj.weight.astype(mx.bfloat16)
-        
-        ## fix attention
-        # self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.DIM)
-        self.ln_2.weight = self.ln_2.weight.astype(mx.bfloat16)
-        self.ln_2.bias = self.ln_2.bias.astype(mx.bfloat16)
         self.mlp = MLP(config)
 
     def __call__(self, x):
         x = self.ln_1(x)
-        # print('After layer norm dtype: ', x.dtype)
         x = x + self.attn(x, x, x)
-        # print('After attention dtype : ', x.dtype)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -101,16 +53,13 @@ class GPT(nn.Module):
         self.config = config
         
         self.transformer_wpe = nn.Embedding(config.MAX_TOKENS, config.DIM)
-        self.transformer_wpe.weight = self.transformer_wpe.weight.astype(mx.bfloat16)
         
         self.transformer_wte = nn.Embedding(config.VOCAB_SIZE, config.DIM)
-        self.transformer_wte.weight = self.transformer_wte.weight.astype(mx.bfloat16)
         
         self.transformer_h = [Block(config) for _ in range(config.NUM_LAYERS)]
         self.transformer_ln_f = nn.LayerNorm(config.DIM)
-        self.transformer_ln_f.weight = self.transformer_ln_f.weight.astype(mx.bfloat16)
-        self.transformer_ln_f.bias = self.transformer_ln_f.bias.astype(mx.bfloat16)
         
+        # TODO: parameter sharing doesn't work after gradient updates. Check why.
         # self.lm_head =  nn.Linear(config.DIM, config.VOCAB_SIZE, bias=False)
         # self.lm_head.weight = self.transformer_wte.weight
 
@@ -195,15 +144,14 @@ def get_batch(batch_size=32, max_tokens = 1024):
 
 
 # model = GPT.from_pretrained('gpt2')
-mlx.core.random.seed(42)
 mlx.core.random.seed(1337)
 
 # print('\n'.join(model.generate("Hello, I'm a language model,", max_tokens=10, num_samples=1)))
 
 model = GPT(GPTConfig())
+model.set_dtype(mx.bfloat16)
 mx.eval(model.parameters())
-# model = mlx.compile(model)
-# print('Compiled.')
+
 import time
 
 BATCH_SIZE = 4
@@ -214,7 +162,6 @@ state = [model.state, optimizer.state]
 
 def loss_fn(model, x, y, reduce=True):
     logits = model(x)
-    # print(logits.dtype)
     losses = nn.losses.cross_entropy(logits, y)
     return mx.mean(losses) if reduce else mx.mean(losses, axis=(-1, -2))
 
@@ -225,7 +172,6 @@ def step(inputs, targets):
     optimizer.update(model, grads)
     return loss
 
-optimizer.set_dtype(mx.bfloat16)
 for epoch in range(100):
 
 
